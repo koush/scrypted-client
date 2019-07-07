@@ -2,19 +2,19 @@ import { EventListener, ScryptedStatic, SystemManager, ScryptedDevice, EventDeta
 import { Socket, SocketOptions } from 'engine.io-client';
 const Client = require('engine.io-client');
 import axios from 'axios';
-const cloneDeep = require('lodash.clonedeep');
 
 const allMethods: any[] = [].concat(... Object.values(ScryptedInterfaceDescriptors).map((type: any) => type.methods));
 const allProperties: any[] = [].concat(... Object.values(ScryptedInterfaceDescriptors).map((type: any) => type.properties));
 
 class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
+    session: ClientSession;
+    constructor(session: ClientSession, id: string) {
+        this.session = session;
+        this.id = id;
+    }
+
     setRoom(arg0: string): void {
         throw new Error("Method not implemented.");
-    }
-    systemManager: SystemManagerImpl;
-    constructor(systemManager: SystemManagerImpl, id: string) {
-        this.systemManager = systemManager;
-        this.id = id;
     }
 
     listen(event: string | EventListenerOptions, callback: (eventSource: ScryptedDevice | null, eventDetails: EventDetails, eventData: object) => void): EventListenerRegister {
@@ -30,7 +30,7 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
     id: string;
 
     get? (target: any, property: PropertyKey, receiver: any): any {
-        const state = this.systemManager.systemState[this.id];
+        const state = this.session.systemState[this.id];
         if (!state) {
             return undefined;
         }
@@ -43,7 +43,9 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
             case "room":
             case "name":
             case "type":
-                return state[property].value;
+            case "component":
+            case "metadata":
+                return state[property] && state[property].value;
         }
 
         if (allProperties.includes(property)) {
@@ -81,7 +83,7 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
                 method: target(),
             };
         }
-        this.systemManager.send({
+        this.session.send({
             type: 'method',
             id: this.id,
             method: target(),
@@ -91,22 +93,18 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
 }
 
 class SystemManagerImpl implements SystemManager {
-    apiUrl: string;
-    systemState: any = {};
-    socket: Socket;
+    session: ClientSession;
 
-    constructor(socket: Socket, apiUrl: string, systemState: any) {
-        this.socket = socket;
-        this.apiUrl = apiUrl;
-        this.systemState = systemState;
+    constructor(session: ClientSession) {
+        this.session = session;
     }
     getDeviceById(id: string): ScryptedDevice | null {
-        const ret = this.systemState[id];
+        const ret = this.session.systemState[id];
         if (!ret) {
             return null;
         }
 
-        const device = new ScryptedDeviceImpl(this, id);
+        const device = new ScryptedDeviceImpl(this.session, id);
         return new Proxy(device, device);
     }
     getDeviceByName(name: string): ScryptedDevice | null {
@@ -118,10 +116,16 @@ class SystemManagerImpl implements SystemManager {
     getSystemState(): object {
         // note: sending back reference is potentially wonky. but this allows
         // vue to turn this into a observable object.
-        return this.systemState;
+        return this.session.systemState;
     }
-    send(data: any) {
-        this.socket.send(JSON.stringify(data));
+    getInstalledPackages(): Promise<object> {
+        const resultId = Math.random().toString();
+        this.session.send({
+            resultId,
+            type: 'system',
+            method: 'getInstalledPackages',
+        });
+        return this.session.newPendingResult(resultId);
     }
     listeners: any = {};
     listen(callback: (eventSource: ScryptedDevice | null, eventDetails: EventDetails, eventData: object) => void): EventListenerRegister {
@@ -139,7 +143,7 @@ class SystemManagerImpl implements SystemManager {
                 if (!eventDetails.property) {
                     return;
                 }
-                const device = this.systemState[message.id] = this.systemState[message.id] || {};
+                const device = this.session.systemState[id] = this.session.systemState[id] || {};
                 var state = device[eventDetails.property] = device[eventDetails.property] || {};
                 state = Object.assign(state, {
                     stateTime: state.value !== eventData ? eventDetails.eventTime : state.lastEventTime,
@@ -155,6 +159,15 @@ class SystemManagerImpl implements SystemManager {
                         console.error('scrypted client: error in listener', e);
                     }
                 }
+
+                if (eventDetails.property === 'id' && !eventData) {
+                    delete this.session.systemState[id];
+                }
+                break;
+            }
+            case 'system': {
+                const { resultId, error, result } = message;
+                this.session.resolvePendingResult(resultId, result, error);
                 break;
             }
         }
@@ -162,46 +175,33 @@ class SystemManagerImpl implements SystemManager {
 }
 
 class MediaManagerImpl implements MediaManager {
-    apiUrl: string;
-    systemState: any = {};
-    socket: Socket;
+    session: ClientSession;
 
-    constructor(socket: Socket, apiUrl: string, systemState: any) {
-        this.socket = socket;
-        this.apiUrl = apiUrl;
-        this.systemState = systemState;
+    constructor(session: ClientSession) {
+        this.session = session;
     }
-    results: any = {};
     convertMediaObjectToBuffer(mediaSource: MediaObject, toMimeType: string): Promise<Buffer> {
         const resultId = Math.random().toString();
-        this.send({
+        this.session.send({
             type: 'media',
             method: 'convertMediaObjectToBuffer',
             toMimeType,
             mediaSource,
             resultId,
         })
-        var result: any = this.results[resultId] = {};
-        return new Promise<string>((resolve, reject) => {
-            result.resolve = resolve;
-            result.reject = reject;
-        })
+        return this.session.newPendingResult(resultId)
         .then(base64 => Buffer.from(base64, 'base64'));
     }
     _convertMediaObjectToUri(method: string, mediaSource: MediaObject, toMimeType: string): Promise<string> {
         const resultId = Math.random().toString();
-        this.send({
+        this.session.send({
             type: 'media',
             method,
             toMimeType,
             mediaSource,
             resultId,
         })
-        var result: any = this.results[resultId] = {};
-        return new Promise<string>((resolve, reject) => {
-            result.resolve = resolve;
-            result.reject = reject;
-        })
+        return this.session.newPendingResult(resultId);
     }
     convertMediaObjectToUri(mediaSource: MediaObject, toMimeType: string): Promise<string> {
         return this._convertMediaObjectToUri('convertMediaObjectToUri', mediaSource, toMimeType);
@@ -215,24 +215,11 @@ class MediaManagerImpl implements MediaManager {
     createMediaObject(data: string | Buffer | Promise<string | Buffer>, mimeType: string): MediaObject {
         throw new Error("Method not implemented.");
     }
-    send(data: any) {
-        this.socket.send(JSON.stringify(data));
-    }
     handleIncomingMessage(message: any) {
         switch (message.type) {
             case 'media': {
                 const { resultId, error, result } = message;
-                const promise = this.results[resultId];
-                delete this.results[resultId];
-                if (!promise) {
-                    return;
-                }
-                if (result) {
-                    promise.resolve(result, 'base64');
-                }
-                else {
-                    promise.reject(error);
-                }
+                this.session.resolvePendingResult(resultId, result, error);
                 break;
             }
         }
@@ -241,6 +228,44 @@ class MediaManagerImpl implements MediaManager {
 
 export interface ScryptedClientStatic extends ScryptedStatic {
     disconnect(): void;
+}
+
+class ClientSession {
+    apiUrl: string;
+    systemState: any;
+    socket: Socket;
+    pendingResults: any = {};
+
+    send(data: any) {
+        this.socket.send(JSON.stringify(data));
+    }
+
+    constructor(socket: Socket, apiUrl: string, systemState: any) {
+        this.socket = socket;
+        this.apiUrl = apiUrl;
+        this.systemState = systemState;
+    }
+
+    newPendingResult(resultId: string): Promise<any> {
+        var result: any = this.pendingResults[resultId] = {};
+        return new Promise<string>((resolve, reject) => {
+            result.resolve = resolve;
+            result.reject = reject;
+        })
+    }
+    resolvePendingResult(resultId: string, result: any, error: any) {
+        const promise = this.pendingResults[resultId];
+        delete this.pendingResults[resultId];
+        if (!promise) {
+            return;
+        }
+        if (result) {
+            promise.resolve(result);
+        }
+        else {
+            promise.reject(new Error(error));
+        }
+    }
 }
 
 export default {
@@ -261,8 +286,9 @@ export default {
                 try {
                     var { data: systemState } = await axios(`${apiUrl}/state`);
 
-                    const systemManager = new SystemManagerImpl(socket, apiUrl, systemState);
-                    const mediaManager = new MediaManagerImpl(socket, apiUrl, systemState);
+                    const session = new ClientSession(socket, apiUrl, systemState);
+                    const systemManager = new SystemManagerImpl(session);
+                    const mediaManager = new MediaManagerImpl(session);
 
                     socket.on('message', (message: any) => {
                         // console.log(message);
