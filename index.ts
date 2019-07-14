@@ -3,8 +3,8 @@ import { Socket, SocketOptions } from 'engine.io-client';
 const Client = require('engine.io-client');
 import axios from 'axios';
 
-const allMethods: any[] = [].concat(... Object.values(ScryptedInterfaceDescriptors).map((type: any) => type.methods));
-const allProperties: any[] = [].concat(... Object.values(ScryptedInterfaceDescriptors).map((type: any) => type.properties));
+const allMethods: any[] = [].concat(...Object.values(ScryptedInterfaceDescriptors).map((type: any) => type.methods));
+const allProperties: any[] = [].concat(...Object.values(ScryptedInterfaceDescriptors).map((type: any) => type.properties));
 
 class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
     session: ClientSession;
@@ -29,7 +29,7 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
     }
     id: string;
 
-    get? (target: any, property: PropertyKey, receiver: any): any {
+    get?(target: any, property: PropertyKey, receiver: any): any {
         const state = this.session.systemState[this.id];
         if (!state) {
             return undefined;
@@ -65,7 +65,7 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
             return undefined;
         }
 
-        const interfaceMethods: any[] = [].concat(... Object.values(ScryptedInterfaceDescriptors)
+        const interfaceMethods: any[] = [].concat(...Object.values(ScryptedInterfaceDescriptors)
             .filter((type: any) => interfaces.includes(type.name))
             .map((type: any) => type.methods));
 
@@ -76,14 +76,20 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
         return new Proxy(() => property, this);
     }
 
-    apply? (target: any, thisArg: any, argArray?: any): any {
+    apply?(target: any, thisArg: any, argArray?: any): any {
         if (target() == 'getVideoStream') {
             return {
                 id: this.id,
                 method: target(),
             };
         }
-        this.session.send({
+        else if (target() == 'takePicture') {
+            return {
+                id: this.id,
+                method: target(),
+            };
+        }
+        return this.session.rpc({
             type: 'method',
             id: this.id,
             method: target(),
@@ -118,14 +124,11 @@ class SystemManagerImpl implements SystemManager {
         // vue to turn this into a observable object.
         return this.session.systemState;
     }
-    getInstalledPackages(): Promise<object> {
-        const resultId = Math.random().toString();
-        this.session.send({
-            resultId,
+    systemCall(method: string): Promise<any> {
+        return this.session.rpc({
             type: 'system',
-            method: 'getInstalledPackages',
+            method: method,
         });
-        return this.session.newPendingResult(resultId);
     }
     listeners: any = {};
     listen(callback: (eventSource: ScryptedDevice | null, eventDetails: EventDetails, eventData: object) => void): EventListenerRegister {
@@ -139,18 +142,17 @@ class SystemManagerImpl implements SystemManager {
     handleIncomingMessage(message: any) {
         switch (message.type) {
             case 'sync': {
-                const { id, eventDetails, eventData }: {id: string, eventDetails: EventDetails, eventData: any} = message;
-                if (!eventDetails.property) {
-                    return;
+                const { id, eventDetails, eventData }: { id: string, eventDetails: EventDetails, eventData: any } = message;
+                if (eventDetails.property) {
+                    const device = this.session.systemState[id] = this.session.systemState[id] || {};
+                    var state = device[eventDetails.property] = device[eventDetails.property] || {};
+                    state = Object.assign(state, {
+                        stateTime: state.value !== eventData ? eventDetails.eventTime : state.lastEventTime,
+                        lastEventTime: eventDetails.eventTime,
+                        sourceInterface: eventDetails.eventInterface,
+                        value: eventData,
+                    });
                 }
-                const device = this.session.systemState[id] = this.session.systemState[id] || {};
-                var state = device[eventDetails.property] = device[eventDetails.property] || {};
-                state = Object.assign(state, {
-                    stateTime: state.value !== eventData ? eventDetails.eventTime : state.lastEventTime,
-                    lastEventTime: eventDetails.eventTime,
-                    sourceInterface: eventDetails.eventInterface,
-                    value: eventData,
-                });
                 for (var listener of Object.values(this.listeners)) {
                     try {
                         (listener as any)(this.getDeviceById(id), eventDetails, eventData);
@@ -165,11 +167,6 @@ class SystemManagerImpl implements SystemManager {
                 }
                 break;
             }
-            case 'system': {
-                const { resultId, error, result } = message;
-                this.session.resolvePendingResult(resultId, result, error);
-                break;
-            }
         }
     }
 }
@@ -181,27 +178,21 @@ class MediaManagerImpl implements MediaManager {
         this.session = session;
     }
     convertMediaObjectToBuffer(mediaSource: MediaObject, toMimeType: string): Promise<Buffer> {
-        const resultId = Math.random().toString();
-        this.session.send({
+        return this.session.rpc({
             type: 'media',
             method: 'convertMediaObjectToBuffer',
             toMimeType,
             mediaSource,
-            resultId,
         })
-        return this.session.newPendingResult(resultId)
         .then(base64 => Buffer.from(base64, 'base64'));
     }
     _convertMediaObjectToUri(method: string, mediaSource: MediaObject, toMimeType: string): Promise<string> {
-        const resultId = Math.random().toString();
-        this.session.send({
+        return this.session.rpc({
             type: 'media',
             method,
             toMimeType,
             mediaSource,
-            resultId,
-        })
-        return this.session.newPendingResult(resultId);
+        });
     }
     convertMediaObjectToUri(mediaSource: MediaObject, toMimeType: string): Promise<string> {
         return this._convertMediaObjectToUri('convertMediaObjectToUri', mediaSource, toMimeType);
@@ -217,17 +208,14 @@ class MediaManagerImpl implements MediaManager {
     }
     handleIncomingMessage(message: any) {
         switch (message.type) {
-            case 'media': {
-                const { resultId, error, result } = message;
-                this.session.resolvePendingResult(resultId, result, error);
-                break;
-            }
         }
     }
 }
 
 export interface ScryptedClientStatic extends ScryptedStatic {
     disconnect(): void;
+    rpc(method: string, ...args: any[]): Promise<any>;
+    onClose?: Function;
 }
 
 class ClientSession {
@@ -240,10 +228,17 @@ class ClientSession {
         this.socket.send(JSON.stringify(data));
     }
 
-    constructor(socket: Socket, apiUrl: string, systemState: any) {
+    constructor(socket: Socket, apiUrl: string) {
         this.socket = socket;
         this.apiUrl = apiUrl;
-        this.systemState = systemState;
+    }
+
+    rpc(options: any): Promise<any> {
+        const resultId = Math.random().toString();
+        this.send(Object.assign({
+            resultId,
+        }, options));
+        return this.newPendingResult(resultId)
     }
 
     newPendingResult(resultId: string): Promise<any> {
@@ -259,19 +254,26 @@ class ClientSession {
         if (!promise) {
             return;
         }
-        if (result) {
+        if (error === undefined) {
             promise.resolve(result);
         }
         else {
             promise.reject(new Error(error));
         }
     }
+    handleIncomingMessage(message: any) {
+        if (!message.resultId) {
+            return;
+        }
+        const { resultId, error, result } = message;
+        this.resolvePendingResult(resultId, result, error);
+}
 }
 
 export default {
     connect(baseUrl: string): Promise<ScryptedClientStatic> {
         const rootLocation = baseUrl || `${window.location.protocol}//${window.location.host}`;
-        const endpointPath = `/endpoint/@scrypted/ui`;
+        const endpointPath = `/endpoint/@scrypted/core`;
         const endpointUrl = `${rootLocation}${endpointPath}`;
         const apiUrl = `${endpointUrl}/api`;
 
@@ -282,25 +284,44 @@ export default {
             };
             const socket = new Client(rootLocation, options);
 
-            socket.on('open', async function() {
+            socket.on('open', async function () {
                 try {
-                    var { data: systemState } = await axios(`${apiUrl}/state`);
 
-                    const session = new ClientSession(socket, apiUrl, systemState);
+                    const session = new ClientSession(socket, apiUrl);
                     const systemManager = new SystemManagerImpl(session);
                     const mediaManager = new MediaManagerImpl(session);
 
                     socket.on('message', (message: any) => {
                         // console.log(message);
-                        systemManager.handleIncomingMessage(JSON.parse(message))
-                        mediaManager.handleIncomingMessage(JSON.parse(message))
+                        const json = JSON.parse(message);
+                        session.handleIncomingMessage(json);
+                        systemManager.handleIncomingMessage(json);
+                        mediaManager.handleIncomingMessage(json);
                     });
 
-                    resolve({
+                    var client: ScryptedClientStatic = {
                         systemManager,
                         mediaManager,
                         disconnect: socket.close.bind(socket),
-                    });
+                        rpc(method: string, ...args: any[]): Promise<any> {
+                            return session.rpc({
+                                type: 'rpc',
+                                method,
+                                args,
+                            });
+                        }
+                    }
+
+                    var systemState = await systemManager.systemCall('getSystemState');
+                    session.systemState = systemState;
+
+                    socket.on('close', () => {
+                        if (client.onClose) {
+                            client.onClose();
+                        }
+                    })
+
+                    resolve(client);
                 }
                 catch (e) {
                     socket.close();
