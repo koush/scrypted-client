@@ -1,10 +1,11 @@
-import { EventListener, ScryptedStatic, SystemManager, ScryptedDevice, EventDetails, EventListenerRegister, ScryptedDeviceType, EventListenerOptions, ScryptedInterfaceDescriptors, MediaManager, MediaObject, FFMpegInput } from "@scrypted/sdk";
+import { EventListener, ScryptedStatic, SystemManager, ScryptedDevice, EventDetails, EventListenerRegister, ScryptedDeviceType, EventListenerOptions, ScryptedInterfaceDescriptors, MediaManager, MediaObject, FFMpegInput, ScryptedInterface } from "@scrypted/sdk";
 import { Socket, SocketOptions } from 'engine.io-client';
 const Client = require('engine.io-client');
 import axios from 'axios';
 
 const allMethods: any[] = [].concat(...Object.values(ScryptedInterfaceDescriptors).map((type: any) => type.methods));
 const allProperties: any[] = [].concat(...Object.values(ScryptedInterfaceDescriptors).map((type: any) => type.properties));
+const deviceMethods: any[] = ['listen', 'setName', 'setRoom', 'setType'];
 
 class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
     session: ClientSession;
@@ -18,7 +19,36 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
     }
 
     listen(event: string | EventListenerOptions, callback: (eventSource: ScryptedDevice | null, eventDetails: EventDetails, eventData: object) => void): EventListenerRegister {
-        throw new Error("Method not implemented.");
+        var options: EventListenerOptions;
+        if (event instanceof String) {
+            options = {
+                event: event as ScryptedInterface,
+            }
+        }
+        else {
+            options = event as EventListenerOptions;
+        }
+        var listenerId = Math.random().toString();
+        this.session.listeners[listenerId] = callback;
+        
+        this.session.send({
+            type: 'listen',
+            listenerId,
+            id: this.id,
+            options,
+        });
+
+        const removeListener = () => {
+            delete this.session.listeners[listenerId];
+            this.session.send({
+                type: 'removeListener',
+                listenerId,
+            });
+        };
+
+        return {
+            removeListener,
+        }
     }
 
     setName(name: string): void {
@@ -56,6 +86,10 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
             return found ? found.value : undefined;
         }
 
+        if (deviceMethods.includes(property)) {
+            return new Proxy(() => property, this);
+        }
+
         if (!allMethods.includes(property)) {
             return undefined;
         }
@@ -77,6 +111,10 @@ class ScryptedDeviceImpl implements ProxyHandler<object>, ScryptedDevice {
     }
 
     apply?(target: any, thisArg: any, argArray?: any): any {
+        if (deviceMethods.includes(target())) {
+            return (this as any)[target()](...argArray);
+        }
+
         if (target() == 'getVideoStream') {
             return {
                 id: this.id,
@@ -141,6 +179,10 @@ class SystemManagerImpl implements SystemManager {
     }
     handleIncomingMessage(message: any) {
         switch (message.type) {
+            case 'listenEvent': {
+                console.log(message);
+                break;
+            }
             case 'sync': {
                 const { id, eventDetails, eventData }: { id: string, eventDetails: EventDetails, eventData: any } = message;
                 if (eventDetails.property) {
@@ -194,11 +236,17 @@ class MediaManagerImpl implements MediaManager {
             mediaSource,
         });
     }
-    convertMediaObjectToUri(mediaSource: MediaObject, toMimeType: string): Promise<string> {
-        return this._convertMediaObjectToUri('convertMediaObjectToUri', mediaSource, toMimeType);
+    convertMediaObjectToLocalUrl(mediaObject: MediaObject, toMimeType: string): Promise<string> {
+        return this._convertMediaObjectToUri('convertMediaObjectToLocalUri', mediaObject, toMimeType);
     }
-    convertMediaObjectToLocalUri(mediaSource: MediaObject, toMimeType: string): Promise<string> {
-        return this._convertMediaObjectToUri('convertMediaObjectToLocalUri', mediaSource, toMimeType);
+    convertMediaObjectToUrl(mediaObject: MediaObject, toMimeType: string): Promise<string> {
+        return this._convertMediaObjectToUri('convertMediaObjectToUri', mediaObject, toMimeType);
+    }
+    convertMediaObjectToUri(mediaObject: MediaObject, toMimeType: string): Promise<string> {
+        return this.convertMediaObjectToLocalUrl(mediaObject, toMimeType);
+    }
+    convertMediaObjectToLocalUri(mediaObject: MediaObject, toMimeType: string): Promise<string> {
+        return this.convertMediaObjectToLocalUrl(mediaObject, toMimeType);
     }
     createFFmpegMediaObject(ffMpegInput: FFMpegInput): MediaObject {
         throw new Error("Method not implemented.");
@@ -223,6 +271,7 @@ class ClientSession {
     systemState: any;
     socket: Socket;
     pendingResults: any = {};
+    listeners: any = {};
 
     send(data: any) {
         this.socket.send(JSON.stringify(data));
